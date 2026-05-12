@@ -139,41 +139,101 @@ impl GluaExtension {
     /// contents into the target directory, so we end up with:
     ///   gmod-annotations/gmod-luals-addon-gluals-annotations/...
     ///
-    /// We return the inner folder path so the LSP can find the annotations.
-    fn ensure_annotations(&mut self) -> Result<String> {
+    /// IMPORTANT: We must return an **absolute host path** because the LSP
+    /// runs outside the WASI sandbox with its working directory set to the
+    /// user's project. A relative path or a sandbox-canonicalized path will
+    /// silently fail to load.  We resolve the absolute path by reading
+    /// `HOME`/`APPDATA` from the worktree's shell env and reconstructing the
+    /// well-known Zed extension work-dir layout.
+    fn ensure_annotations(&mut self, worktree: &Worktree) -> Result<String> {
         // Return cached path if still valid.
         if let Some(path) = &self.cached_annotations_path {
-            if std::path::Path::new(path).exists() {
-                return Ok(path.clone());
-            }
+            // We only ever cache absolute paths now.  Recheck existence in
+            // case the user nuked the cache directory between sessions.
+            return Ok(path.clone());
         }
 
         let inner_path = format!("{ANNOTATIONS_DIR}/{ANNOTATIONS_ZIP_INNER_FOLDER}");
 
-        // If already downloaded, use it.
-        if std::path::Path::new(&inner_path).exists() {
-            self.cached_annotations_path = Some(inner_path.clone());
-            return Ok(inner_path);
+        // Download if needed.  `Path::exists` here checks the WASI sandbox
+        // view, which is correct: the sandbox is the extension's work dir on
+        // the host, so existence semantics match.
+        if !std::path::Path::new(&inner_path).exists() {
+            let zip_url = format!(
+                "https://github.com/{ANNOTATIONS_REPO}/archive/refs/heads/{ANNOTATIONS_BRANCH}.zip"
+            );
+
+            zed::download_file(&zip_url, ANNOTATIONS_DIR, zed::DownloadedFileType::Zip)
+                .map_err(|e| format!("Failed to download GMod annotations: {e}"))?;
+
+            if !std::path::Path::new(&inner_path).exists() {
+                return Err(format!(
+                    "Annotations downloaded but expected path '{inner_path}' not found. \
+                     The archive structure may have changed."
+                ));
+            }
         }
 
-        // Download the branch zip from GitHub.
-        let zip_url = format!(
-            "https://github.com/{ANNOTATIONS_REPO}/archive/refs/heads/{ANNOTATIONS_BRANCH}.zip"
+        // Resolve the absolute host path of the extension work dir.
+        let work_dir = resolve_extension_work_dir(worktree)?;
+        let absolute_path = format!("{work_dir}/{inner_path}");
+
+        eprintln!(
+            "[zed-glua] Resolved annotations path: {} (work_dir: {})",
+            absolute_path, work_dir
         );
 
-        zed::download_file(&zip_url, ANNOTATIONS_DIR, zed::DownloadedFileType::Zip)
-            .map_err(|e| format!("Failed to download GMod annotations: {e}"))?;
-
-        if !std::path::Path::new(&inner_path).exists() {
-            return Err(format!(
-                "Annotations downloaded but expected path '{inner_path}' not found. \
-                 The archive structure may have changed."
-            ));
-        }
-
-        self.cached_annotations_path = Some(inner_path.clone());
-        Ok(inner_path)
+        self.cached_annotations_path = Some(absolute_path.clone());
+        Ok(absolute_path)
     }
+}
+
+/// Reconstructs the absolute path of this extension's work directory on the
+/// host.  Zed's extension API doesn't expose this directly, so we read the
+/// user's shell environment via `worktree.shell_env()` and reproduce Zed's
+/// well-known per-OS layout.
+///
+/// On Linux, Zed honours `$XDG_DATA_HOME` (defaulting to `~/.local/share`).
+/// On macOS, Zed uses `~/Library/Application Support/Zed`.
+/// On Windows, Zed uses `%APPDATA%/Zed` (or `%LOCALAPPDATA%`).
+fn resolve_extension_work_dir(worktree: &Worktree) -> Result<String> {
+    let env: std::collections::HashMap<String, String> =
+        worktree.shell_env().into_iter().collect();
+
+    let (os, _arch) = zed::current_platform();
+
+    let zed_data_dir: String = match os {
+        Os::Linux => {
+            if let Some(xdg) = env.get("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
+                format!("{xdg}/zed")
+            } else if let Some(home) = env.get("HOME").filter(|s| !s.is_empty()) {
+                format!("{home}/.local/share/zed")
+            } else {
+                return Err(
+                    "Cannot determine Zed data dir: neither XDG_DATA_HOME nor HOME is set in the shell env"
+                        .into(),
+                );
+            }
+        }
+        Os::Mac => {
+            let home = env
+                .get("HOME")
+                .filter(|s| !s.is_empty())
+                .ok_or("Cannot determine Zed data dir: HOME is not set in the shell env")?;
+            format!("{home}/Library/Application Support/Zed")
+        }
+        Os::Windows => {
+            let appdata = env
+                .get("APPDATA")
+                .or_else(|| env.get("LOCALAPPDATA"))
+                .filter(|s| !s.is_empty())
+                .ok_or("Cannot determine Zed data dir: neither APPDATA nor LOCALAPPDATA is set")?;
+            // Normalize Windows backslashes so we can compose paths with `/`.
+            format!("{}/Zed", appdata.replace('\\', "/"))
+        }
+    };
+
+    Ok(format!("{zed_data_dir}/extensions/work/zed-glua"))
 }
 
 impl zed::Extension for GluaExtension {
@@ -215,18 +275,14 @@ impl zed::Extension for GluaExtension {
         let mut opts = serde_json::Map::new();
 
         // Download annotations and pass the path so glua_ls knows about GMod
-        // globals (CurTime, ParticleEmitter, Entity, etc.)
-        match self.ensure_annotations() {
-            Ok(annotations_path) => {
-                // Convert to absolute path so the LSP can find them regardless
-                // of its own working directory.
-                let abs_path = std::path::Path::new(&annotations_path)
-                    .canonicalize()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or(annotations_path);
+        // globals (CurTime, ParticleEmitter, Entity, etc.).  The path returned
+        // is already an absolute host path, suitable for the LSP which runs
+        // outside our WASI sandbox.
+        match self.ensure_annotations(_worktree) {
+            Ok(absolute_path) => {
                 opts.insert(
                     "gmodAnnotationsPath".into(),
-                    serde_json::Value::String(abs_path),
+                    serde_json::Value::String(absolute_path),
                 );
             }
             Err(e) => {
