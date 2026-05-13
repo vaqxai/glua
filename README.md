@@ -101,20 +101,75 @@ as VSCode). A minimal example:
 
 ```json
 {
-  "$schema": "emmyrc-schema://schemas/emmyrc",
+  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/crates/glua_code_analysis/resources/schema.json",
   "workspace": {
     "library": [
       "/path/to/extra/annotations"
     ]
   },
   "diagnostics": {
-    "globals": ["MY_GLOBAL"]
+    "severity": {
+      "undefined-global": "warning"
+    }
   }
 }
 ```
 
 Full schema reference:
 <https://gluals.arnux.net/configuration/overview>.
+
+### Sharing globals across workspace folders
+
+Zed starts a **separate LSP instance per workspace folder**. If you have two
+directories added to the same Zed workspace (e.g. your addon and a shared
+library like `zclib`), the addon's LSP will not know about globals defined in
+the library folder by default.
+
+There are two ways to fix this.
+
+#### Option A — per-project `.gluarc.json` (recommended)
+
+Add a `.gluarc.json` to the project that *uses* the shared library and list
+the library folder under `workspace.library`:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/crates/glua_code_analysis/resources/schema.json",
+  "workspace": {
+    "library": ["C:/path/to/zclib"]
+  }
+}
+```
+
+The LSP will index the library folder as read-only reference code and expose
+all its globals to the current project's files.
+
+#### Option B — global Zed `settings.json`
+
+If you want the library paths to apply to **every** GLua project you open
+(without touching individual `.gluarc.json` files), add them to your Zed
+`settings.json` under `lsp.gmod-glua-ls.initialization_options.workspace.library`:
+
+```json
+{
+  "lsp": {
+    "gmod-glua-ls": {
+      "initialization_options": {
+        "workspace": {
+          "library": [
+            "C:/path/to/zclib",
+            "C:/path/to/another-shared-lib"
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+The extension automatically **deep-merges** these paths with any library
+paths it injects itself (e.g. the GMod annotations), so nothing is
+overwritten.
 
 ### LSP settings via Zed
 

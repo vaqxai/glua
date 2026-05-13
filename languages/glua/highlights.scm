@@ -83,9 +83,10 @@
 (vararg_expression) @variable.special
 
 ; Operators — standard Lua
+; Note: "//" is intentionally absent — in GLua it is a line comment.
 [
   "+"  "-"  "*"  "/"  "%"  "^"  "#"
-  "&"  "~"  "|"  "<<"  ">>"  "//"
+  "&"  "~"  "|"  "<<"  ">>"
   "=="  "~="  "<"  "<="  ">"  ">="
   "="
   "("  ")"  "{"  "}"  "["  "]"

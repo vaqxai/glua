@@ -223,17 +223,94 @@ fn resolve_extension_work_dir(worktree: &Worktree) -> Result<String> {
             format!("{home}/Library/Application Support/Zed")
         }
         Os::Windows => {
-            let appdata = env
-                .get("APPDATA")
-                .or_else(|| env.get("LOCALAPPDATA"))
+            // Zed stores its data under %LOCALAPPDATA%\Zed on Windows
+            // (e.g. C:\Users\<user>\AppData\Local\Zed), NOT %APPDATA%\Zed
+            // (which would be the Roaming folder). We must prefer
+            // LOCALAPPDATA; APPDATA is only useful as a last resort, and
+            // even then we have to rewrite "…/Roaming" → "…/Local" because
+            // the Roaming Zed dir does not exist on disk.
+            let raw = env
+                .get("LOCALAPPDATA")
                 .filter(|s| !s.is_empty())
-                .ok_or("Cannot determine Zed data dir: neither APPDATA nor LOCALAPPDATA is set")?;
+                .map(|s| format!("{s}/Zed"))
+                .or_else(|| {
+                    // Derive %LOCALAPPDATA% from %USERPROFILE% if the shell
+                    // env didn't propagate LOCALAPPDATA itself.
+                    env.get("USERPROFILE")
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("{s}/AppData/Local/Zed"))
+                })
+                .or_else(|| {
+                    // Last-resort: rewrite APPDATA's trailing "Roaming"
+                    // segment to "Local".
+                    env.get("APPDATA")
+                        .filter(|s| !s.is_empty())
+                        .map(|s| {
+                            let normalized = s.replace('\\', "/");
+                            if let Some(stripped) = normalized
+                                .strip_suffix("/Roaming")
+                                .or_else(|| normalized.strip_suffix("/roaming"))
+                            {
+                                format!("{stripped}/Local/Zed")
+                            } else {
+                                format!("{normalized}/Zed")
+                            }
+                        })
+                })
+                .ok_or(
+                    "Cannot determine Zed data dir on Windows: none of LOCALAPPDATA, USERPROFILE, or APPDATA is set in the shell env",
+                )?;
             // Normalize Windows backslashes so we can compose paths with `/`.
-            format!("{}/Zed", appdata.replace('\\', "/"))
+            raw.replace('\\', "/")
         }
     };
 
     Ok(format!("{zed_data_dir}/extensions/work/zed-glua"))
+}
+
+/// Deep-merges a user-supplied `workspace` JSON object into `opts`.
+///
+/// Arrays (e.g. `workspace.library`) are *unioned* (user entries appended
+/// after any existing entries) rather than replaced, so that the extension's
+/// own entries are never lost.  All other scalar / object keys inside
+/// `workspace` are inserted with the user's value taking precedence.
+fn deep_merge_workspace(
+    opts: &mut serde_json::Map<String, serde_json::Value>,
+    user_workspace: serde_json::Value,
+) {
+    let serde_json::Value::Object(user_ws_map) = user_workspace else {
+        // If it's not an object, just overwrite wholesale.
+        opts.insert("workspace".into(), user_workspace);
+        return;
+    };
+
+    // Obtain or create the "workspace" object in opts.
+    let existing_ws = opts
+        .entry("workspace")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    let serde_json::Value::Object(ref mut existing_map) = *existing_ws else {
+        // Existing value is not an object – overwrite.
+        *existing_ws = serde_json::Value::Object(user_ws_map);
+        return;
+    };
+
+    for (k, v) in user_ws_map {
+        match (existing_map.get_mut(&k), &v) {
+            // Union arrays so neither side's entries are lost.
+            (Some(serde_json::Value::Array(existing_arr)), serde_json::Value::Array(user_arr)) => {
+                for item in user_arr {
+                    if !existing_arr.contains(item) {
+                        existing_arr.push(item.clone());
+                    }
+                }
+            }
+            // For everything else the user value wins.
+            _ => {
+                existing_map.insert(k, v);
+            }
+        }
+    }
 }
 
 impl zed::Extension for GluaExtension {
@@ -249,6 +326,15 @@ impl zed::Extension for GluaExtension {
         language_server_id: &LanguageServerId,
         worktree: &Worktree,
     ) -> Result<Command> {
+        // Log every LSP spawn so we can see in the Zed log which worktrees
+        // are triggering new glua_ls instances (including "Unknown worktree"
+        // entries that appear in the LSP Logs tab).
+        eprintln!(
+            "[zed-glua] language_server_command called | id={} | root='{}'",
+            language_server_id,
+            worktree.root_path()
+        );
+
         let binary = self.language_server_binary(language_server_id, worktree)?;
 
         // Allow the user to pass extra args via Zed LSP settings:
@@ -292,22 +378,149 @@ impl zed::Extension for GluaExtension {
             }
         }
 
-        // Merge any user-provided initialization_options on top so they can
-        // override or add keys.
+        // Merge any user-provided initialization_options on top.
+        //
+        // Special handling for `workspace.library`:
+        //   glua_ls reads `workspace.library` from `.gluarc.json` on disk, but
+        //   it also accepts it via init options.  Users who have GLua projects
+        //   spread across multiple on-disk directories (e.g. an addon that
+        //   depends on a shared library like zclib kept in a separate workspace
+        //   folder) can list those extra paths in their Zed `settings.json`:
+        //
+        //   "lsp": {
+        //     "gmod-glua-ls": {
+        //       "initialization_options": {
+        //         "workspace": {
+        //           "library": ["C:/path/to/zclib", "C:/path/to/other-lib"]
+        //         }
+        //       }
+        //     }
+        //   }
+        //
+        //   The extension deep-merges `workspace.library` arrays so that any
+        //   paths already present in `opts` (e.g. coming from an extension
+        //   feature in the future) are preserved alongside the user's entries.
         if let Ok(settings) = LspSettings::for_worktree("gmod-glua-ls", _worktree) {
             if let Some(user_opts) = settings.initialization_options {
                 if let serde_json::Value::Object(user_map) = user_opts {
                     for (k, v) in user_map {
-                        opts.insert(k, v);
+                        if k == "workspace" {
+                            // Deep-merge the "workspace" object so that
+                            // workspace.library entries are unioned rather than
+                            // overwritten wholesale.
+                            deep_merge_workspace(&mut opts, v);
+                        } else {
+                            opts.insert(k, v);
+                        }
                     }
                 }
             }
         }
 
+        // Log the final init options so users can diagnose configuration
+        // problems (e.g. missing workspace.library paths) by looking at the
+        // Zed log file.
+        eprintln!(
+            "[zed-glua] worktree root  : {}",
+            _worktree.root_path()
+        );
+        eprintln!(
+            "[zed-glua] init_options   : {}",
+            serde_json::to_string(&opts).unwrap_or_else(|_| "<serialization error>".into())
+        );
+
         if opts.is_empty() {
             Ok(None)
         } else {
             Ok(Some(serde_json::Value::Object(opts)))
+        }
+    }
+
+    /// Called by Zed whenever glua_ls fires a `workspace/configuration` request.
+    ///
+    /// `glua_ls` receives its full configuration (workspace.library, diagnostics,
+    /// etc.) through this channel — NOT by reading `.gluarc.json` from disk
+    /// itself.  Without this method the LSP gets `{}` and ignores everything in
+    /// `.gluarc.json`, including `workspace.library`, which is why globals from
+    /// other workspace folders were never visible.
+    ///
+    /// This implementation:
+    ///  1. Reads `.gluarc.json` / `.luarc.json` / `.emmyrc.json` from the
+    ///     worktree root (whichever exists first).
+    ///  2. Injects `gmod.annotationsPath` so the LSP always knows where the
+    ///     downloaded GMod wiki annotations live, even without a config file.
+    ///  3. Merges any `workspace.library` paths the user supplied via Zed
+    ///     LSP settings (`initialization_options.workspace.library`) on top,
+    ///     so both approaches work simultaneously.
+    fn language_server_workspace_configuration(
+        &mut self,
+        _language_server_id: &LanguageServerId,
+        worktree: &Worktree,
+    ) -> Result<Option<serde_json::Value>> {
+        // 1. Load on-disk config file (first one that exists wins).
+        let mut cfg: serde_json::Map<String, serde_json::Value> = {
+            let names = [".gluarc.json", ".luarc.json", ".emmyrc.json"];
+            let mut found: Option<serde_json::Map<String, serde_json::Value>> = None;
+            for name in &names {
+                match worktree.read_text_file(name) {
+                    Ok(text) => {
+                        match serde_json::from_str::<serde_json::Value>(&text) {
+                            Ok(serde_json::Value::Object(m)) => {
+                                eprintln!("[zed-glua] read config file   : {name}");
+                                found = Some(m);
+                                break;
+                            }
+                            Ok(_) => {
+                                eprintln!("[zed-glua] config file not object: {name}");
+                            }
+                            Err(e) => {
+                                eprintln!("[zed-glua] config file parse error {name}: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[zed-glua] read_text_file({name}) failed: {e}");
+                    }
+                }
+            }
+            found.unwrap_or_default()
+        };
+
+        // 2. Inject gmod.annotationsPath so the LSP finds the downloaded
+        //    GMod wiki annotations regardless of whether the user has a
+        //    config file.  Don't overwrite an explicit user value.
+        if let Ok(abs_path) = self.ensure_annotations(worktree) {
+            let gmod_entry = cfg
+                .entry("gmod")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let serde_json::Value::Object(gmod_map) = gmod_entry {
+                gmod_map
+                    .entry("annotationsPath")
+                    .or_insert_with(|| serde_json::Value::String(abs_path));
+            }
+        }
+
+        // 3. Merge workspace.library paths from Zed LSP settings on top of
+        //    whatever the config file already specifies.
+        if let Ok(settings) = LspSettings::for_worktree("gmod-glua-ls", worktree) {
+            if let Some(user_opts) = settings.initialization_options {
+                if let serde_json::Value::Object(user_map) = user_opts {
+                    if let Some(user_ws) = user_map.get("workspace") {
+                        deep_merge_workspace(&mut cfg, user_ws.clone());
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "[zed-glua] workspace_cfg  : {}",
+            serde_json::to_string(&cfg).unwrap_or_else(|_| "<serialization error>".into())
+        );
+
+        if cfg.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(serde_json::Value::Object(cfg)))
         }
     }
 }
