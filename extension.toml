@@ -1,10 +1,10 @@
-id = "zed-glua"
+id = "glua"
 name = "Garry's Mod Lua Support"
 version = "0.0.1"
 schema_version = 1
 authors = ["Vaqxai <vaqxai@gmail.com>", "Pollux12"]
 description = "Adds support for the Garry's Mod Lua variant to Zed, complete with LSP support (lsp by Pollux12)"
-repository = "https://github.com/vaqxai/zed-glua"
+repository = "https://github.com/vaqxai/glua"
 
 [grammars.lua]
 repository = "https://github.com/tree-sitter-grammars/tree-sitter-lua"

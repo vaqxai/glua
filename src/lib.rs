@@ -141,11 +141,8 @@ impl GluaExtension {
     ///
     /// IMPORTANT: We must return an **absolute host path** because the LSP
     /// runs outside the WASI sandbox with its working directory set to the
-    /// user's project. A relative path or a sandbox-canonicalized path will
-    /// silently fail to load.  We resolve the absolute path by reading
-    /// `HOME`/`APPDATA` from the worktree's shell env and reconstructing the
-    /// well-known Zed extension work-dir layout.
-    fn ensure_annotations(&mut self, worktree: &Worktree) -> Result<String> {
+    /// user's project. A relative path will silently fail to load.
+    fn ensure_annotations(&mut self) -> Result<String> {
         // Return cached path if still valid.
         if let Some(path) = &self.cached_annotations_path {
             // We only ever cache absolute paths now.  Recheck existence in
@@ -175,11 +172,11 @@ impl GluaExtension {
         }
 
         // Resolve the absolute host path of the extension work dir.
-        let work_dir = resolve_extension_work_dir(worktree)?;
+        let work_dir = resolve_extension_work_dir()?;
         let absolute_path = format!("{work_dir}/{inner_path}");
 
         eprintln!(
-            "[zed-glua] Resolved annotations path: {} (work_dir: {})",
+            "[glua] Resolved annotations path: {} (work_dir: {})",
             absolute_path, work_dir
         );
 
@@ -188,84 +185,12 @@ impl GluaExtension {
     }
 }
 
-/// Reconstructs the absolute path of this extension's work directory on the
-/// host.  Zed's extension API doesn't expose this directly, so we read the
-/// user's shell environment via `worktree.shell_env()` and reproduce Zed's
-/// well-known per-OS layout.
-///
-/// On Linux, Zed honours `$XDG_DATA_HOME` (defaulting to `~/.local/share`).
-/// On macOS, Zed uses `~/Library/Application Support/Zed`.
-/// On Windows, Zed uses `%APPDATA%/Zed` (or `%LOCALAPPDATA%`).
-fn resolve_extension_work_dir(worktree: &Worktree) -> Result<String> {
-    let env: std::collections::HashMap<String, String> =
-        worktree.shell_env().into_iter().collect();
-
-    let (os, _arch) = zed::current_platform();
-
-    let zed_data_dir: String = match os {
-        Os::Linux => {
-            if let Some(xdg) = env.get("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
-                format!("{xdg}/zed")
-            } else if let Some(home) = env.get("HOME").filter(|s| !s.is_empty()) {
-                format!("{home}/.local/share/zed")
-            } else {
-                return Err(
-                    "Cannot determine Zed data dir: neither XDG_DATA_HOME nor HOME is set in the shell env"
-                        .into(),
-                );
-            }
-        }
-        Os::Mac => {
-            let home = env
-                .get("HOME")
-                .filter(|s| !s.is_empty())
-                .ok_or("Cannot determine Zed data dir: HOME is not set in the shell env")?;
-            format!("{home}/Library/Application Support/Zed")
-        }
-        Os::Windows => {
-            // Zed stores its data under %LOCALAPPDATA%\Zed on Windows
-            // (e.g. C:\Users\<user>\AppData\Local\Zed), NOT %APPDATA%\Zed
-            // (which would be the Roaming folder). We must prefer
-            // LOCALAPPDATA; APPDATA is only useful as a last resort, and
-            // even then we have to rewrite "…/Roaming" → "…/Local" because
-            // the Roaming Zed dir does not exist on disk.
-            let raw = env
-                .get("LOCALAPPDATA")
-                .filter(|s| !s.is_empty())
-                .map(|s| format!("{s}/Zed"))
-                .or_else(|| {
-                    // Derive %LOCALAPPDATA% from %USERPROFILE% if the shell
-                    // env didn't propagate LOCALAPPDATA itself.
-                    env.get("USERPROFILE")
-                        .filter(|s| !s.is_empty())
-                        .map(|s| format!("{s}/AppData/Local/Zed"))
-                })
-                .or_else(|| {
-                    // Last-resort: rewrite APPDATA's trailing "Roaming"
-                    // segment to "Local".
-                    env.get("APPDATA")
-                        .filter(|s| !s.is_empty())
-                        .map(|s| {
-                            let normalized = s.replace('\\', "/");
-                            if let Some(stripped) = normalized
-                                .strip_suffix("/Roaming")
-                                .or_else(|| normalized.strip_suffix("/roaming"))
-                            {
-                                format!("{stripped}/Local/Zed")
-                            } else {
-                                format!("{normalized}/Zed")
-                            }
-                        })
-                })
-                .ok_or(
-                    "Cannot determine Zed data dir on Windows: none of LOCALAPPDATA, USERPROFILE, or APPDATA is set in the shell env",
-                )?;
-            // Normalize Windows backslashes so we can compose paths with `/`.
-            raw.replace('\\', "/")
-        }
-    };
-
-    Ok(format!("{zed_data_dir}/extensions/work/zed-glua"))
+/// Returns the absolute host path of this extension's work directory, which
+/// Zed sets as the extension's current directory.
+fn resolve_extension_work_dir() -> Result<String> {
+    let dir = std::env::current_dir()
+        .map_err(|e| format!("Cannot determine extension work dir: {e}"))?;
+    Ok(dir.to_string_lossy().replace('\\', "/"))
 }
 
 /// Deep-merges a user-supplied `workspace` JSON object into `opts`.
@@ -330,7 +255,7 @@ impl zed::Extension for GluaExtension {
         // are triggering new glua_ls instances (including "Unknown worktree"
         // entries that appear in the LSP Logs tab).
         eprintln!(
-            "[zed-glua] language_server_command called | id={} | root='{}'",
+            "[glua] language_server_command called | id={} | root='{}'",
             language_server_id,
             worktree.root_path()
         );
@@ -364,7 +289,7 @@ impl zed::Extension for GluaExtension {
         // globals (CurTime, ParticleEmitter, Entity, etc.).  The path returned
         // is already an absolute host path, suitable for the LSP which runs
         // outside our WASI sandbox.
-        match self.ensure_annotations(_worktree) {
+        match self.ensure_annotations() {
             Ok(absolute_path) => {
                 opts.insert(
                     "gmodAnnotationsPath".into(),
@@ -374,7 +299,7 @@ impl zed::Extension for GluaExtension {
             Err(e) => {
                 // Non-fatal: the LSP will still work, just without GMod
                 // globals.  Log the error so the user can see it.
-                eprintln!("[zed-glua] Failed to set up annotations: {e}");
+                eprintln!("[glua] Failed to set up annotations: {e}");
             }
         }
 
@@ -421,11 +346,11 @@ impl zed::Extension for GluaExtension {
         // problems (e.g. missing workspace.library paths) by looking at the
         // Zed log file.
         eprintln!(
-            "[zed-glua] worktree root  : {}",
+            "[glua] worktree root  : {}",
             _worktree.root_path()
         );
         eprintln!(
-            "[zed-glua] init_options   : {}",
+            "[glua] init_options   : {}",
             serde_json::to_string(&opts).unwrap_or_else(|_| "<serialization error>".into())
         );
 
@@ -466,20 +391,20 @@ impl zed::Extension for GluaExtension {
                     Ok(text) => {
                         match serde_json::from_str::<serde_json::Value>(&text) {
                             Ok(serde_json::Value::Object(m)) => {
-                                eprintln!("[zed-glua] read config file   : {name}");
+                                eprintln!("[glua] read config file   : {name}");
                                 found = Some(m);
                                 break;
                             }
                             Ok(_) => {
-                                eprintln!("[zed-glua] config file not object: {name}");
+                                eprintln!("[glua] config file not object: {name}");
                             }
                             Err(e) => {
-                                eprintln!("[zed-glua] config file parse error {name}: {e}");
+                                eprintln!("[glua] config file parse error {name}: {e}");
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("[zed-glua] read_text_file({name}) failed: {e}");
+                        eprintln!("[glua] read_text_file({name}) failed: {e}");
                     }
                 }
             }
@@ -489,7 +414,7 @@ impl zed::Extension for GluaExtension {
         // 2. Inject gmod.annotationsPath so the LSP finds the downloaded
         //    GMod wiki annotations regardless of whether the user has a
         //    config file.  Don't overwrite an explicit user value.
-        if let Ok(abs_path) = self.ensure_annotations(worktree) {
+        if let Ok(abs_path) = self.ensure_annotations() {
             let gmod_entry = cfg
                 .entry("gmod")
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
@@ -513,7 +438,7 @@ impl zed::Extension for GluaExtension {
         }
 
         eprintln!(
-            "[zed-glua] workspace_cfg  : {}",
+            "[glua] workspace_cfg  : {}",
             serde_json::to_string(&cfg).unwrap_or_else(|_| "<serialization error>".into())
         );
 
