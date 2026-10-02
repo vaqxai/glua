@@ -1,32 +1,37 @@
 ; Inherit all standard Lua highlights from tree-sitter-lua.
 ; This file adds GLua-specific overrides on top.
 
-; Keywords
+; Keywords (anonymous tokens that the grammar exposes as queryable literals)
 [
   "and"
-  "break"
   "do"
   "else"
   "elseif"
   "end"
-  "false"
   "for"
   "function"
   "goto"
   "if"
   "in"
   "local"
-  "nil"
   "not"
   "or"
   "repeat"
   "return"
   "then"
-  "true"
   "until"
   "while"
-  "continue"
 ] @keyword
+
+; `break_statement` is defined as a single-string rule in tree-sitter-lua, so
+; the literal "break" isn't a queryable anonymous node — we must match the
+; named node instead.
+(break_statement) @keyword
+
+; GLua adds `continue`, which standard Lua doesn't have. The grammar parses it
+; as a plain identifier, so highlight by text match.
+((identifier) @keyword
+ (#eq? @keyword "continue"))
 
 ; Functions
 (function_declaration
@@ -37,9 +42,6 @@
 
 (function_declaration
   name: (method_index_expression) @function)
-
-(local_function_statement
-  name: (identifier) @function)
 
 (function_call
   name: (identifier) @function.call)
@@ -61,9 +63,10 @@
  (#match? @type "^[A-Z][A-Z0-9_]+$"))
 
 ; Strings
-(string) @string
-(string_start) @string
-(string_end) @string
+(string
+  start: _ @punctuation.special
+  content: (string_content) @string
+  end: _ @punctuation.special)
 
 ; String escape sequences
 (escape_sequence) @string.escape
@@ -76,15 +79,19 @@
 (false) @boolean
 (nil) @constant.builtin
 
+; Vararg (also a single-string rule — match named node)
+(vararg_expression) @variable.special
+
 ; Operators — standard Lua
+; Note: "//" is intentionally absent — in GLua it is a line comment.
 [
   "+"  "-"  "*"  "/"  "%"  "^"  "#"
-  "&"  "~"  "|"  "<<"  ">>"  "//"
+  "&"  "~"  "|"  "<<"  ">>"
   "=="  "~="  "<"  "<="  ">"  ">="
   "="
   "("  ")"  "{"  "}"  "["  "]"
   "::"
-  ";"  ":"  ","  "."  ".."  "..."
+  ";"  ":"  ","  "."  ".."
 ] @operator
 
 ; GLua C-style operators — these are just tokenized as identifiers or
