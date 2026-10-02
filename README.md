@@ -50,13 +50,13 @@ editor](https://zed.dev), backed by Pollux12's
 ### From source (dev install)
 
 ```sh
-git clone https://github.com/vaqxai/zed-glua
+git clone https://github.com/vaqxai/glua
 ```
 
 Then in Zed:
 
 1. `zed: extensions` → **Install Dev Extension**.
-2. Point it at the cloned `zed-glua` directory.
+2. Point it at the cloned `glua` directory.
 
 Zed will compile the extension to wasm and install it locally.
 
@@ -71,9 +71,9 @@ The first time you open a `.lua` file with GLua selected, the extension will:
 Expect a one-time pause of a few seconds while these downloads happen. They
 land in:
 
-- **Linux:** `~/.local/share/zed/extensions/work/zed-glua/`
-- **macOS:** `~/Library/Application Support/Zed/extensions/work/zed-glua/`
-- **Windows:** `%APPDATA%\Zed\extensions\work\zed-glua\`
+- **Linux:** `~/.local/share/zed/extensions/work/glua/`
+- **macOS:** `~/Library/Application Support/Zed/extensions/work/glua/`
+- **Windows:** `%LOCALAPPDATA%\Zed\extensions\work\glua\`
 
 Subsequent launches are instant and offline-capable.
 
@@ -243,7 +243,7 @@ log file:
 Look for a line like:
 
 ```
-[INFO glua_ls::handlers::initialized] Received gmodAnnotationsPath from VSCode: /home/.../zed-glua/gmod-annotations/...
+[INFO glua_ls::handlers::initialized] Received gmodAnnotationsPath from VSCode: /home/.../glua/gmod-annotations/...
 ```
 
 (The "from VSCode" string is hardcoded in the LSP — it doesn't actually mean
@@ -294,7 +294,7 @@ recognized."
 **Mitigations:**
 
 1. **Open an issue** on this repository with the failing path from the
-   LSP log and the actual location of your `zed-glua` work directory.
+   LSP log and the actual location of your `glua` work directory.
 2. **Workaround**: set `gluals.ls.annotationPath` in a `.gluarc.json` to
    the actual on-disk location of the annotations directory.
 3. **Track upstream**: ideally Zed would expose
@@ -315,4 +315,4 @@ recognized."
 
 ## License
 
-MIT.
+GPL-3.0. See [LICENSE](LICENSE).

@@ -1,7 +1,0 @@
-name = "GLua"
-grammar = "lua"
-path_suffixes = ["lua"]
-line_comments = ["-- ", "// "]
-block_comment = { start = "--[[", end = "]]" }
-tab_size = 4
-hard_tabs = false

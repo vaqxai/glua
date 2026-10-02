@@ -178,6 +178,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "glua"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "zed_extension_api",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -736,14 +744,6 @@ dependencies = [
  "quote",
  "syn",
  "synstructure",
-]
-
-[[package]]
-name = "zed-glua"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "zed_extension_api",
 ]
 
 [[package]]
