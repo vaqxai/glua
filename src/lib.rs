@@ -10,6 +10,10 @@ const ANNOTATIONS_BRANCH: &str = "gluals-annotations";
 /// The top-level folder inside the GitHub-generated zip archive.
 const ANNOTATIONS_ZIP_INNER_FOLDER: &str = "gmod-luals-addon-gluals-annotations";
 const ANNOTATIONS_DIR: &str = "gmod-annotations";
+/// Holds the unix timestamp of the last successful annotations download.
+const ANNOTATIONS_STAMP_FILE: &str = ".downloaded_at";
+/// Re-download the annotations branch after this long so users pick up wiki updates.
+const ANNOTATIONS_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
 struct GluaExtension {
     cached_binary_path: Option<String>,
@@ -143,31 +147,28 @@ impl GluaExtension {
     /// runs outside the WASI sandbox with its working directory set to the
     /// user's project. A relative path will silently fail to load.
     fn ensure_annotations(&mut self) -> Result<String> {
-        // Return cached path if still valid.
+        // `Path::exists` here checks the WASI sandbox view, which is correct:
+        // the sandbox is the extension's work dir on the host, so existence
+        // semantics match.
+        let inner_path = format!("{ANNOTATIONS_DIR}/{ANNOTATIONS_ZIP_INNER_FOLDER}");
+        let have_annotations = std::path::Path::new(&inner_path).exists();
+
+        // Return cached path if still valid.  Recheck existence in case the
+        // user deleted the work dir while Zed was running.
         if let Some(path) = &self.cached_annotations_path {
-            // We only ever cache absolute paths now.  Recheck existence in
-            // case the user nuked the cache directory between sessions.
-            return Ok(path.clone());
+            if have_annotations && !annotations_stale() {
+                return Ok(path.clone());
+            }
         }
 
-        let inner_path = format!("{ANNOTATIONS_DIR}/{ANNOTATIONS_ZIP_INNER_FOLDER}");
-
-        // Download if needed.  `Path::exists` here checks the WASI sandbox
-        // view, which is correct: the sandbox is the extension's work dir on
-        // the host, so existence semantics match.
-        if !std::path::Path::new(&inner_path).exists() {
-            let zip_url = format!(
-                "https://github.com/{ANNOTATIONS_REPO}/archive/refs/heads/{ANNOTATIONS_BRANCH}.zip"
-            );
-
-            zed::download_file(&zip_url, ANNOTATIONS_DIR, zed::DownloadedFileType::Zip)
-                .map_err(|e| format!("Failed to download GMod annotations: {e}"))?;
-
-            if !std::path::Path::new(&inner_path).exists() {
-                return Err(format!(
-                    "Annotations downloaded but expected path '{inner_path}' not found. \
-                     The archive structure may have changed."
-                ));
+        if !have_annotations || annotations_stale() {
+            match download_annotations() {
+                Ok(()) => {}
+                // A failed refresh is not fatal if we still have an older copy.
+                Err(e) if have_annotations => {
+                    eprintln!("[glua] Failed to refresh GMod annotations, using existing copy: {e}");
+                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -175,14 +176,60 @@ impl GluaExtension {
         let work_dir = resolve_extension_work_dir()?;
         let absolute_path = format!("{work_dir}/{inner_path}");
 
-        eprintln!(
-            "[glua] Resolved annotations path: {} (work_dir: {})",
-            absolute_path, work_dir
-        );
-
         self.cached_annotations_path = Some(absolute_path.clone());
         Ok(absolute_path)
     }
+}
+
+/// Returns `true` if the annotations were never downloaded or were downloaded
+/// more than `ANNOTATIONS_MAX_AGE_SECS` ago.
+fn annotations_stale() -> bool {
+    let Ok(stamp) = std::fs::read_to_string(format!("{ANNOTATIONS_DIR}/{ANNOTATIONS_STAMP_FILE}"))
+    else {
+        return true;
+    };
+    let Ok(downloaded_at) = stamp.trim().parse::<u64>() else {
+        return true;
+    };
+    unix_now().saturating_sub(downloaded_at) > ANNOTATIONS_MAX_AGE_SECS
+}
+
+/// Downloads the annotations into a temporary directory and swaps it into
+/// place only once the download succeeded, so a failed refresh never leaves
+/// the user without annotations.
+fn download_annotations() -> Result<()> {
+    let zip_url =
+        format!("https://github.com/{ANNOTATIONS_REPO}/archive/refs/heads/{ANNOTATIONS_BRANCH}.zip");
+    let tmp_dir = format!("{ANNOTATIONS_DIR}.tmp");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    zed::download_file(&zip_url, &tmp_dir, zed::DownloadedFileType::Zip)
+        .map_err(|e| format!("Failed to download GMod annotations: {e}"))?;
+
+    if !std::path::Path::new(&format!("{tmp_dir}/{ANNOTATIONS_ZIP_INNER_FOLDER}")).exists() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(format!(
+            "Annotations downloaded but expected folder '{ANNOTATIONS_ZIP_INNER_FOLDER}' not found. \
+             The archive structure may have changed."
+        ));
+    }
+
+    let _ = std::fs::remove_dir_all(ANNOTATIONS_DIR);
+    std::fs::rename(&tmp_dir, ANNOTATIONS_DIR)
+        .map_err(|e| format!("Failed to move GMod annotations into place: {e}"))?;
+    std::fs::write(
+        format!("{ANNOTATIONS_DIR}/{ANNOTATIONS_STAMP_FILE}"),
+        unix_now().to_string(),
+    )
+    .map_err(|e| format!("Failed to write annotations timestamp: {e}"))?;
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Returns the absolute host path of this extension's work directory, which
@@ -251,15 +298,6 @@ impl zed::Extension for GluaExtension {
         language_server_id: &LanguageServerId,
         worktree: &Worktree,
     ) -> Result<Command> {
-        // Log every LSP spawn so we can see in the Zed log which worktrees
-        // are triggering new glua_ls instances (including "Unknown worktree"
-        // entries that appear in the LSP Logs tab).
-        eprintln!(
-            "[glua] language_server_command called | id={} | root='{}'",
-            language_server_id,
-            worktree.root_path()
-        );
-
         let binary = self.language_server_binary(language_server_id, worktree)?;
 
         // Allow the user to pass extra args via Zed LSP settings:
@@ -281,7 +319,7 @@ impl zed::Extension for GluaExtension {
     fn language_server_initialization_options(
         &mut self,
         _language_server_id: &LanguageServerId,
-        _worktree: &Worktree,
+        worktree: &Worktree,
     ) -> Result<Option<serde_json::Value>> {
         let mut opts = serde_json::Map::new();
 
@@ -325,7 +363,7 @@ impl zed::Extension for GluaExtension {
         //   The extension deep-merges `workspace.library` arrays so that any
         //   paths already present in `opts` (e.g. coming from an extension
         //   feature in the future) are preserved alongside the user's entries.
-        if let Ok(settings) = LspSettings::for_worktree("gmod-glua-ls", _worktree) {
+        if let Ok(settings) = LspSettings::for_worktree("gmod-glua-ls", worktree) {
             if let Some(user_opts) = settings.initialization_options {
                 if let serde_json::Value::Object(user_map) = user_opts {
                     for (k, v) in user_map {
@@ -341,18 +379,6 @@ impl zed::Extension for GluaExtension {
                 }
             }
         }
-
-        // Log the final init options so users can diagnose configuration
-        // problems (e.g. missing workspace.library paths) by looking at the
-        // Zed log file.
-        eprintln!(
-            "[glua] worktree root  : {}",
-            _worktree.root_path()
-        );
-        eprintln!(
-            "[glua] init_options   : {}",
-            serde_json::to_string(&opts).unwrap_or_else(|_| "<serialization error>".into())
-        );
 
         if opts.is_empty() {
             Ok(None)
@@ -387,24 +413,19 @@ impl zed::Extension for GluaExtension {
             let names = [".gluarc.json", ".luarc.json", ".emmyrc.json"];
             let mut found: Option<serde_json::Map<String, serde_json::Value>> = None;
             for name in &names {
-                match worktree.read_text_file(name) {
-                    Ok(text) => {
-                        match serde_json::from_str::<serde_json::Value>(&text) {
-                            Ok(serde_json::Value::Object(m)) => {
-                                eprintln!("[glua] read config file   : {name}");
-                                found = Some(m);
-                                break;
-                            }
-                            Ok(_) => {
-                                eprintln!("[glua] config file not object: {name}");
-                            }
-                            Err(e) => {
-                                eprintln!("[glua] config file parse error {name}: {e}");
-                            }
+                // A missing file is the common case, so read errors are not logged.
+                if let Ok(text) = worktree.read_text_file(name) {
+                    match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(serde_json::Value::Object(m)) => {
+                            found = Some(m);
+                            break;
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("[glua] read_text_file({name}) failed: {e}");
+                        Ok(_) => {
+                            eprintln!("[glua] config file not object: {name}");
+                        }
+                        Err(e) => {
+                            eprintln!("[glua] config file parse error {name}: {e}");
+                        }
                     }
                 }
             }
@@ -436,11 +457,6 @@ impl zed::Extension for GluaExtension {
                 }
             }
         }
-
-        eprintln!(
-            "[glua] workspace_cfg  : {}",
-            serde_json::to_string(&cfg).unwrap_or_else(|_| "<serialization error>".into())
-        );
 
         if cfg.is_empty() {
             Ok(None)

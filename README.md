@@ -26,7 +26,7 @@ editor](https://zed.dev), backed by Pollux12's
 ## Requirements
 
 - Zed (latest stable). The extension is built against
-  `zed_extension_api = 0.4`.
+  `zed_extension_api = 0.7`.
 - An internet connection on first launch so the extension can download:
   - The platform-appropriate `glua_ls` binary from the
     [`Pollux12/gmod-glua-ls`](https://github.com/Pollux12/gmod-glua-ls/releases)
@@ -75,7 +75,8 @@ land in:
 - **macOS:** `~/Library/Application Support/Zed/extensions/work/glua/`
 - **Windows:** `%LOCALAPPDATA%\Zed\extensions\work\glua\`
 
-Subsequent launches are instant and offline-capable.
+Subsequent launches are instant and offline-capable. The annotations are
+re-downloaded automatically once they are more than a week old.
 
 ## Getting GLua applied to `.lua` files
 
@@ -250,8 +251,8 @@ Look for a line like:
 the path came from VSCode.)
 
 If that line is missing or the path is `None`, the extension failed to
-resolve an absolute path to the annotations directory. See **"On Zed
-updates"** below for the most likely cause and remediation.
+resolve an absolute path to the annotations directory. See **"How the
+annotations path is resolved"** below for a workaround.
 
 ### Diagnostics are stale or wrong
 
@@ -264,42 +265,34 @@ restart Zed — this forces a clean re-download.
 This is the same problem as **"LSP starts but GMod globals are not
 recognized"**. Stdlib annotations ship inside the `glua_ls` binary and are
 loaded via a separate mechanism; the GMod annotations come from the
-downloaded zip and require the absolute-path workaround described below.
+downloaded zip and are passed to the LSP by absolute path, as described below.
 
-## On Zed updates (the fragile bit)
+## How the annotations path is resolved
 
-⚠️ **The annotations download mechanism depends on Zed's internal directory
-layout.** Zed currently does not expose, via its extension API, the
-absolute host path of an extension's working directory. To pass the GMod
-annotation files to the language server (which runs outside the WASI
-sandbox), this extension reconstructs that path by combining:
+The language server runs outside Zed's WASI sandbox, so it needs an absolute
+path to the downloaded GMod annotations. The extension takes it from its own
+working directory (`std::env::current_dir()`), which Zed sets to the
+extension's work directory (see **First launch** above), and passes it to the
+LSP as `gmodAnnotationsPath` / `gmod.annotationsPath`.
 
-- `worktree.shell_env()["HOME"]` (or `XDG_DATA_HOME` / `APPDATA` /
-  `LOCALAPPDATA` depending on OS), with
-- Zed's well-known per-platform extension storage location.
+The annotations are re-downloaded once they are more than a week old so wiki
+updates are picked up. If a refresh fails (e.g. you are offline), the
+previously downloaded copy keeps being used.
 
-If a future Zed release changes where it stores extension work
-directories, the path reconstruction will break, the language server will
-silently fail to find the annotations, and you'll be back to "globals not
-recognized."
+If the annotations still don't load, you can point the LSP at a copy
+yourself by setting `gmod.annotationsPath` in `.gluarc.json`. An explicit
+value there is never overwritten by the extension:
 
-**Symptoms of breakage after a Zed update:**
+```json
+{
+  "gmod": {
+    "annotationsPath": "/path/to/gmod-luals-addon-gluals-annotations"
+  }
+}
+```
 
-- Lua stdlib still works (hover on `math.pi`, `string.format`, etc.).
-- Every GMod global (`Angle`, `Vector`, `ents`, `hook`, ...) shows as
-  undefined.
-- The LSP log shows the annotation path the extension sent, but the path
-  does not exist on disk.
-
-**Mitigations:**
-
-1. **Open an issue** on this repository with the failing path from the
-   LSP log and the actual location of your `glua` work directory.
-2. **Workaround**: set `gluals.ls.annotationPath` in a `.gluarc.json` to
-   the actual on-disk location of the annotations directory.
-3. **Track upstream**: ideally Zed would expose
-   `Worktree::extension_work_dir()` or similar; if you're a Zed user
-   reading this, upvoting or filing such a feature request helps.
+If you have to do this, please open an issue on this repository with the
+path from the LSP log and the actual location of your `glua` work directory.
 
 ## Credits
 
